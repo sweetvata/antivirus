@@ -40,22 +40,31 @@ public class InputBlocker {
 }
 
 public class VirusManager {
-    public List<PictureBox> Viruses = new List<PictureBox>();
-    public List<float> VX = new List<float>();
-    public List<float> VY = new List<float>();
-    public void Add(PictureBox pb, float vx, float vy) {
-        Viruses.Add(pb); VX.Add(vx); VY.Add(vy);
+    public List<PictureBox> Viruses  = new List<PictureBox>();
+    public List<float>      Angle    = new List<float>();   // текущий угол орбиты (рад)
+    public List<float>      Speed    = new List<float>();   // угловая скорость (рад/тик)
+    public List<float>      OrbitX   = new List<float>();   // радиус по X
+    public List<float>      OrbitY   = new List<float>();   // радиус по Y
+    public List<float>      CX       = new List<float>();   // центр орбиты X
+    public List<float>      CY       = new List<float>();   // центр орбиты Y
+
+    public void Add(PictureBox pb, float angle, float speed, float orbitX, float orbitY, float cx, float cy) {
+        Viruses.Add(pb);
+        Angle.Add(angle);
+        Speed.Add(speed);
+        OrbitX.Add(orbitX);
+        OrbitY.Add(orbitY);
+        CX.Add(cx);
+        CY.Add(cy);
     }
+
     public void MoveAll(int W, int H) {
         for (int i = 0; i < Viruses.Count; i++) {
-            float nx = Viruses[i].Left + VX[i];
-            float ny = Viruses[i].Top  + VY[i];
-            if (nx < -90)       nx = W + 10;
-            else if (nx > W+10) nx = -90;
-            if (ny < -90)       ny = H + 10;
-            else if (ny > H+10) ny = -90;
-            Viruses[i].Left = (int)nx;
-            Viruses[i].Top  = (int)ny;
+            Angle[i] += Speed[i];
+            int nx = (int)(CX[i] + Math.Cos(Angle[i]) * OrbitX[i]) - Viruses[i].Width / 2;
+            int ny = (int)(CY[i] + Math.Sin(Angle[i]) * OrbitY[i]) - Viruses[i].Height / 2;
+            Viruses[i].Left = nx;
+            Viruses[i].Top  = ny;
         }
     }
 }
@@ -234,9 +243,13 @@ function StartPhase2 {
     }
     $script:spawnedPBs.Clear()
 
-    # Создать VirusManager и мини-вирусы
+    # Создать VirusManager и мини-вирусы (орбитальное движение)
     $script:vm = New-Object VirusManager
     $W = $script:panel.Width; $H = $script:panel.Height
+    $cxF = [float]($W / 2); $cyF = [float]($H / 2)
+    # Угловая скорость 350° за 20 сек = 17.5°/сек = ~0.305 рад/сек
+    # При 16мс/тик: 0.305 * 0.016 = ~0.00488 рад/тик
+    $baseSpeed = [float](350.0 * [Math]::PI / 180.0 / (20000.0 / 16.0))
 
     for ($i = 0; $i -lt 40; $i++) {
         $sz = $rng.Next(50, 86)
@@ -244,14 +257,15 @@ function StartPhase2 {
         $pb.Width     = $sz; $pb.Height = $sz
         $pb.SizeMode  = 'StretchImage'
         $pb.Image     = $script:virusImg
-        $pb.Left      = $rng.Next(0, $W)
-        $pb.Top       = $rng.Next(0, $H)
         $script:panel.Controls.Add($pb)
-        $vx = [float]($rng.NextDouble() * 6 + 3)
-        $vy = [float]($rng.NextDouble() * 6 + 3)
-        if ($rng.Next(2) -eq 0) { $vx = -$vx }
-        if ($rng.Next(2) -eq 0) { $vy = -$vy }
-        $script:vm.Add($pb, $vx, $vy)
+        # Каждый вирус — своя эллиптическая орбита вокруг центра экрана
+        $orbitX = [float]($rng.Next(80, [int]($W * 0.45)))
+        $orbitY = [float]($rng.Next(60, [int]($H * 0.45)))
+        $angle  = [float]($rng.NextDouble() * 2 * [Math]::PI)
+        # Скорость: базовая ±30%, знак случайный (по/против часовой)
+        $spd = [float]($baseSpeed * (0.7 + $rng.NextDouble() * 0.6))
+        if ($rng.Next(2) -eq 0) { $spd = -$spd }
+        $script:vm.Add($pb, $angle, $spd, $orbitX, $orbitY, $cxF, $cyF)
     }
 
     $t1.Start(); $tStop.Start(); $tClose.Start()
@@ -259,7 +273,7 @@ function StartPhase2 {
 
 # ── Таймеры Phase1 ─────────────────────────────────────────────────────────────
 $tSpawn = New-Object System.Windows.Forms.Timer
-$tSpawn.Interval = 20
+$tSpawn.Interval = 80
 $tSpawn.Add_Tick({
     $W = $script:panel.Width; $H = $script:panel.Height
     $sz = $rng.Next(40, 201)
@@ -309,22 +323,24 @@ $tStop.Add_Tick({
     $norm = ((90 - $script:a) % 360 + 360) % 360
     $idx  = [int]([Math]::Floor($norm / $script:sweep)) % $script:N
     $script:result = $script:lbl[$idx]
-    # +40 быстрых вирусов
+    # +40 быстрых вирусов (орбиты в 3 раза быстрее)
     $W = $script:panel.Width; $H = $script:panel.Height
+    $cxF = [float]($W / 2); $cyF = [float]($H / 2)
+    $baseSpeed = [float](350.0 * [Math]::PI / 180.0 / (20000.0 / 16.0))
+    $fastSpeed = $baseSpeed * 3.0
     for ($i = 0; $i -lt 40; $i++) {
         $sz = $rng.Next(50, 86)
         $pb = New-Object System.Windows.Forms.PictureBox
         $pb.Width = $sz; $pb.Height = $sz
         $pb.SizeMode = 'StretchImage'
         $pb.Image = $script:virusImg
-        $pb.Left  = $rng.Next(0, $W)
-        $pb.Top   = $rng.Next(0, $H)
         $script:panel.Controls.Add($pb)
-        $vx = [float]($rng.NextDouble() * 8 + 12)
-        $vy = [float]($rng.NextDouble() * 8 + 12)
-        if ($rng.Next(2) -eq 0) { $vx = -$vx }
-        if ($rng.Next(2) -eq 0) { $vy = -$vy }
-        $script:vm.Add($pb, $vx, $vy)
+        $orbitX = [float]($rng.Next(80, [int]($W * 0.45)))
+        $orbitY = [float]($rng.Next(60, [int]($H * 0.45)))
+        $angle  = [float]($rng.NextDouble() * 2 * [Math]::PI)
+        $spd    = [float]($fastSpeed * (0.7 + $rng.NextDouble() * 0.6))
+        if ($rng.Next(2) -eq 0) { $spd = -$spd }
+        $script:vm.Add($pb, $angle, $spd, $orbitX, $orbitY, $cxF, $cyF)
     }
 })
 
